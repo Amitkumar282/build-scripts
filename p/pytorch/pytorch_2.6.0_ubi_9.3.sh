@@ -29,13 +29,15 @@ SCRIPT_DIR=$(pwd)
 yum install -y git make wget python3.12 python3.12-devel python3.12-pip pkgconfig atlas
 yum install gcc-toolset-13 -y
 echo "Installed gcc-toolset"
-yum install -y make libtool  xz zlib-devel openssl-devel bzip2-devel libffi-devel libevent-devel  patch ninja-build gcc-toolset-13 pkg-config
+yum install -y make libtool  xz zlib-devel openssl-devel bzip2-devel libffi-devel libevent-devel  patch ninja-build gcc-toolset-13 pkg-config pkgconf-pkg-config
 dnf install -y gcc-toolset-13-libatomic-devel
 echo "Installed required deps from RH"
 
 export PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64:$LD_LIBRARY_PATH
 
+# Ensure pkg-config can find Python (required for NumPy build with Meson)
+export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 echo "Installing cmake..."
 wget https://cmake.org/files/v3.31/cmake-3.31.6.tar.gz
@@ -188,7 +190,7 @@ git apply set_cpp_to_17_v4.25.3.patch
 
 echo "Installing protobuf...."
 cd python
-python3.12 -m pip install .
+python3.12 -m pip install --no-build-isolation .
 cd $SCRIPT_DIR
 
 echo "------------ libprotobuf,protobuf installed--------------"
@@ -255,6 +257,7 @@ export LD_LIBRARY_PATH="/protobuf/third_party/abseil-cpp/local/abseilcpp/lib:${L
 export CXXFLAGS="${CXXFLAGS} -mcpu=${cpu_opt_arch} -mtune=${cpu_opt_tune}"
 export CFLAGS="${CFLAGS} -mcpu=${cpu_opt_arch} -mtune=${cpu_opt_tune}"
 export LD_LIBRARY_PATH="${SCRIPT_DIR}/pytorch/torch/lib/:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${SCRIPT_DIR}/pytorch/torch/lib64/:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${SCRIPT_DIR}/protobuf/local/libprotobuf/lib64/:${LD_LIBRARY_PATH}"
 
 echo "required env variables got set"

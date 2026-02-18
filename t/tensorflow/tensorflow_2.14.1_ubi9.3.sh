@@ -42,9 +42,30 @@ yum install -y gcc-toolset-12 gcc-toolset-12-binutils gcc-toolset-12-binutils-de
 yum install -y libxcrypt-compat rsync
 python3.11 -m pip install --upgrade pip
 
-
-
 yum install -y  autoconf automake libtool curl-devel  atlas-devel patch 
+
+
+# Set up environment variables for GCC 12
+export GCC_HOME=/opt/rh/gcc-toolset-12/root/usr
+export CC=$GCC_HOME/bin/gcc
+export CXX=$GCC_HOME/bin/g++
+export GCC=$CC
+export GXX=$CXX
+
+# Add GCC 12 to the PATH (removing previous gcc paths if any)
+export PATH=$(echo $PATH | tr ':' '\n' | grep -v -e '/gcc-toolset' -e '/usr/bin/gcc' | tr '\n' ':')
+export PATH=$GCC_HOME/bin:$PATH
+
+export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v -e '/gcc-toolset' | tr '\n' ':')
+export LD_LIBRARY_PATH=$GCC_HOME/lib64:$LD_LIBRARY_PATH
+
+ln -sf /opt/rh/gcc-toolset-12/root/usr/lib64/libctf.so.0 /usr/lib64/libctf.so.0
+
+# Verify GCC 12 installation
+gcc --version
+
+OS_NAME=$(cat /etc/os-release | grep ^PRETTY_NAME | cut -d= -f2)
+
 
 echo "-----------installing openblas................"
 cd $CURRENT_DIR
@@ -121,6 +142,23 @@ python3.11 -c "import h5py; print(h5py.__version__)"
 echo "-----------------------------------------------------Installed h5py-----------------------------------------------------"
 
 
+# Prevent LLVM assembler failure on ppc64le
+export CFLAGS="-O1"
+export CXXFLAGS="-O1"
+export BAZEL_CXXOPTS="-O1"
+export LLVM_DISABLE_PDB=1
+export LLVM_ENABLE_ASSERTIONS=0
+export LLVM_OPTIMIZE_SIZE=1
+
+# FIX FOR FLAKY BAZEL DOWNLOADS
+export TF_USE_GIT_CLONE_FOR_BAZEL=1
+export BAZEL_USE_CPP_ONLY_TOOLCHAIN=1
+export TF_MIRROR_URL=""
+export BAZEL_DOWNLOAD_USE_GCE_MIRROR=false
+export BAZEL_FETCH_TIMEOUT=600
+export BAZEL_FETCH_RETRIES=5
+
+
 #installing patchelf from source
 cd $CURRENT_DIR
 yum install -y git autoconf automake libtool make
@@ -188,6 +226,15 @@ git clone $PACKAGE_URL
 cd  $PACKAGE_NAME
 git checkout $PACKAGE_VERSION
 
+echo "----------------------------bazel dist dir--------------------------------"
+mkdir -p $CURRENT_DIR/bazel-dist
+cd $CURRENT_DIR/bazel-dist
+wget -nc https://github.com/google/boringssl/archive/b9232f9e27e5668bc0414879dcdedb2a59ea75f2.tar.gz
+cd -
+ 
+echo "-------------------------------bazel clean--------------------------------"
+bazel clean --expunge || true
+
 echo "------------------------Exporting variable-------------------"
 cpu_model=$(lscpu | grep "Model name:" | awk -F: '{print $2}' | tr '[:upper:]' '[:lower:]' | cut -d '(' -f1 | cut -d ',' -f1 | xargs)
 export CC_OPT_FLAGS="-mcpu=${cpu_model} -mtune=${cpu_model}"
@@ -214,6 +261,9 @@ export TFCI_WHL_NUMPY_VERSION=1
 export CXXFLAGS="$(echo ${CXXFLAGS} | sed -e 's/ -fno-plt//')"
 export CFLAGS="$(echo ${CFLAGS} | sed -e 's/ -fno-plt//')"
 
+export BAZEL_LLVM_ENABLE_PDB=0
+
+
 # Apply the patch
 echo "------------------------Applying patch-------------------"
 wget https://raw.githubusercontent.com/ppc64le/build-scripts/refs/heads/master/t/tensorflow/tf_2.14.1_fix.patch
@@ -225,8 +275,9 @@ yes n | ./configure
 echo "------------------------Bazel query-------------------"
 bazel query "//tensorflow/tools/pip_package:*"
 
+
 #Install
-if ! (bazel build -s //tensorflow/tools/pip_package:build_pip_package --config=opt) ; then  
+if ! (bazel build -s --distdir=/bazel-dist //tensorflow/tools/pip_package:build_pip_package --config=opt --define=llvm_enable_pdb=false) ; then  
     echo "------------------$PACKAGE_NAME:Install_fails-------------------------------------"
     echo "$PACKAGE_URL $PACKAGE_NAME"
     echo "$PACKAGE_NAME  |  $PACKAGE_URL | $PACKAGE_VERSION | GitHub | Fail |  Install_Fails"
