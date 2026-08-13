@@ -43,11 +43,14 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# COS configuration 
-COS_API_KEY = os.environ["GHA_CURRENCY_SERVICE_ID_API_KEY"]
-COS_SERVICE_INSTANCE_ID = os.environ["GHA_CURRENCY_SERVICE_ID"]
+# COS configuration — only available in currency builds.
+# When absent, suffix resolution is skipped and PR_BUILD_FALLBACK_SUFFIX is used;
+# all other post-processing steps (license injection, classifier, RECORD) still run.
+COS_API_KEY = os.environ.get("GHA_CURRENCY_SERVICE_ID_API_KEY", "")
+COS_SERVICE_INSTANCE_ID = os.environ.get("GHA_CURRENCY_SERVICE_ID", "")
 COS_ENDPOINT = "https://s3.us.cloud-object-storage.appdomain.cloud"
 COS_BUCKET = "ose-power-artifacts-production"
+
 
 # License extraction utilities
 LICENSE_PATTERN = re.compile(r"^(LICENSE|COPYING)(\..*)?$")
@@ -101,12 +104,22 @@ def normalize_so_name(so_name):
     return re.sub(r'-[0-9a-f]{8,}(?=(?:\.so|\.\d))', '', so_name)
 
 def find_all_so_anywhere(so_name):
-    # Search for the .so file anywhere in the filesystem
+    # Search for the .so file anywhere in the filesystem, excluding site-packages
     try:
         result = run_command(["find", ".", "-type", "f", "-name", so_name])
         if len(result.stdout) == 0:
             result = run_command(["find", "/", "-type", "f", "-name", so_name])
-        return result.stdout.strip().splitlines()
+        
+        # Filter out paths containing site-packages to avoid using installed packages
+        all_paths = result.stdout.strip().splitlines()
+        filtered_paths = [p for p in all_paths if "site-packages" not in p]
+        
+        # If filtering removed all paths, log error and exit
+        if not filtered_paths and all_paths:
+            logger.error(f"All paths for {so_name} were in site-packages, no valid build path found")
+            sys.exit(1)
+        
+        return filtered_paths
     except Exception as e:
         logger.error(f"Failed to find .so files → {e}")
         return []
@@ -158,12 +171,13 @@ def find_project_root(so_path, max_up=10):
 
 
 def find_license_in_directory(directory):
-    # Look for LICENSE files in the given directory
+    # Look for all LICENSE files in the given directory
     try:
+        license_files = []
         for f in os.listdir(directory):
             if LICENSE_PATTERN.match(f):
-                return os.path.join(directory, f)
-        return None
+                license_files.append(os.path.join(directory, f))
+        return license_files if license_files else None
     except Exception as e:
         logger.error(f"Failed to find license in directory {directory} → {e}")
         return None
@@ -269,15 +283,25 @@ def process_so_file(so_path, rpm_licenses, bundled_licenses):
             # Bundled license check
             project_root = find_project_root(match_so)
             if project_root:
-                license_file = find_license_in_directory(project_root)
-                if license_file:
+                license_files = find_license_in_directory(project_root)
+                if license_files:
                     try:
-                        with open(license_file, "r", encoding="utf-8", errors="ignore") as f:
-                            bundled_licenses.setdefault(f.read(), []).append(original_name)
+                        # Read all license files and combine them with separator
+                        combined_license = []
+                        for license_file in license_files:
+                            with open(license_file, "r", encoding="utf-8", errors="ignore") as f:
+                                license_content = f.read()
+                                if license_content:
+                                    combined_license.append(license_content)
+                        
+                        if combined_license:
+                            # Join all licenses with the separator
+                            full_license_text = f"\n\n{LICENSE_SEPARATOR}\n\n".join(combined_license)
+                            bundled_licenses.setdefault(full_license_text, []).append(original_name)
                             license_found = True
-                            break  # stop after successfully read bundled license
+                            break  # stop after successfully read bundled licenses
                     except Exception:
-                        # Failed to read this license file, continue to next match_so
+                        # Failed to read license files, continue to next match_so
                         continue
 
         # Fallback if no license found in any path
@@ -380,7 +404,16 @@ def regenerate_record(extract_path, dist_info_dir):
         logger.exception(f"Failed to regenerate RECORD file → {e}")
 
 def resolve_suffix(client, package, version, wheel_name, wheel_sha256):
-    # Resolve a unique suffix for the wheel based on its name and local hash
+    # Resolve a unique suffix for the wheel based on its name and local hash.
+    # When client is None (PR build — no COS credentials), skip COS lookup
+    # and return None to signal that suffix addition should be skipped entirely.
+    if client is None:
+        logger.info(
+            "COS client not available (PR build) — skipping suffix resolution, "
+            "no suffix will be added to the wheel."
+        )
+        return None
+
     try:
         logger.info(f"Resolving suffix for package={package}, version={version}, wheel={wheel_name}")
         parts = wheel_name[:-4].rsplit("-", 3)
@@ -471,7 +504,9 @@ def inject_classifier(dist_info):
 def process_wheel(wheel_path, suffix):
     try:
         logger.info(f"Processing wheel: {wheel_path} with suffix: {suffix}")
-        wheel_dir = os.path.dirname(wheel_path)
+        # os.path.dirname of a bare filename returns ""; normalise to "." so
+        # that "wheel pack -d <dir>" and os.path.join produce consistent paths.
+        wheel_dir = os.path.dirname(wheel_path) or "."
         wheel_name = os.path.basename(wheel_path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -519,30 +554,39 @@ def process_wheel(wheel_path, suffix):
                 if existing_license_files:
                     update_record(dist_info, existing_license_files)
 
-                # Version suffix processing
-                old_version = read_version_from_metadata(dist_info)
-            
-                if old_version is None:
-                   logger.error("Version not found in METADATA, cannot proceed")
-                   sys.exit(1)
-                   
-                new_version = build_new_version(old_version, suffix)
-                update_metadata_version(dist_info, new_version)
-                dist_info = rename_dist_info_dir(extract_path, old_version, new_version)
-                regenerate_record(extract_path, dist_info)
+                # Version suffix processing — skipped in PR builds (suffix is None).
+                if suffix is not None:
+                    old_version = read_version_from_metadata(dist_info)
+
+                    if old_version is None:
+                        logger.error("Version not found in METADATA, cannot proceed")
+                        sys.exit(1)
+
+                    new_version = build_new_version(old_version, suffix)
+                    update_metadata_version(dist_info, new_version)
+                    dist_info = rename_dist_info_dir(extract_path, old_version, new_version)
+                    regenerate_record(extract_path, dist_info)
+                else:
+                    logger.info("Suffix addition skipped (PR build — no COS credentials).")
 
             # Pack wheel
             subprocess.run(["wheel", "pack", extract_path, "-d", wheel_dir], check=True)
 
         new_wheel_name = wheel_name
-        if "+" in old_version:
-            base, local = old_version.split("+", 1)
-            new_wheel_name = wheel_name.replace(f"{base}+{local}", f"{base}+{local}{suffix}", 1)
-        else:
-            new_wheel_name = wheel_name.replace(old_version, f"{old_version}+{suffix}", 1)
+        if suffix is not None and old_version is not None:
+            if "+" in old_version:
+                base, local = old_version.split("+", 1)
+                new_wheel_name = wheel_name.replace(f"{base}+{local}", f"{base}+{local}{suffix}", 1)
+            else:
+                new_wheel_name = wheel_name.replace(old_version, f"{old_version}+{suffix}", 1)
 
         new_wheel_path = os.path.join(wheel_dir, new_wheel_name)
-        os.remove(wheel_path)
+        # Only remove the original when the repacked wheel is a genuinely
+        # different file (suffix was added → new filename).  Use abspath so
+        # that "foo.whl" and "./foo.whl" compare as equal and we never
+        # accidentally delete the freshly repacked wheel in PR builds.
+        if os.path.abspath(new_wheel_path) != os.path.abspath(wheel_path):
+            os.remove(wheel_path)
         logger.info("Processing wheel completed")
         return new_wheel_path
     except Exception as e:
@@ -571,16 +615,22 @@ def main():
     wheel_path = sys.argv[1]
     wheel_sha256 = sys.argv[2]
 
-    # Resolve suffix using COS
     wheel_name = os.path.basename(wheel_path)
     parts = wheel_name.split("-")
     package = parts[0]
     version = parts[1]
 
-    client = create_cos_client()
-    if client is None:
-        logger.error("COS client creation failed")
-        sys.exit(1)
+    # Create COS client only when credentials are available (currency builds).
+    # In PR builds credentials are absent — client stays None and resolve_suffix
+    # will return PR_BUILD_FALLBACK_SUFFIX without contacting COS.
+    if COS_API_KEY and COS_SERVICE_INSTANCE_ID:
+        client = create_cos_client()
+        if client is None:
+            logger.error("COS client creation failed")
+            sys.exit(1)
+    else:
+        logger.info("COS credentials not set — running in PR build mode (suffix resolution skipped)")
+        client = None
 
     suffix = resolve_suffix(
         client,
@@ -589,7 +639,7 @@ def main():
         wheel_name,
         wheel_sha256
     )
-    
+
     new_wheel = process_wheel(wheel_path, suffix)
     if not new_wheel:
         logger.error("Wheel processing failed")
